@@ -18,8 +18,12 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"math"
+	"net/http"
 	"os"
+	"strconv"
 
 	"github.com/red-hat-storage/ocs-client-operator/api/v1alpha1"
 	"github.com/red-hat-storage/ocs-client-operator/pkg/utils"
@@ -27,6 +31,8 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 	quotav1 "github.com/openshift/api/quota/v1"
 	opv1a1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	providerclient "github.com/red-hat-storage/ocs-operator/services/provider/api/v4/client"
 	"github.com/red-hat-storage/ocs-operator/services/provider/api/v4/interfaces"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -84,6 +90,20 @@ func main() {
 		klog.Exitf("%s env var not set", utils.OperatorVersionEnvVar)
 	}
 
+	metricsServiceName, isSet := os.LookupEnv(utils.MetricsServiceNameEnvVar)
+	if !isSet {
+		klog.Exitf("%s env var not set", utils.MetricsServiceNameEnvVar)
+	}
+
+	metricsPortStr, isSet := os.LookupEnv(utils.MetricsPortEnvVar)
+	if !isSet {
+		klog.Exitf("%s env var not set", utils.MetricsPortEnvVar)
+	}
+	metricsPort, err := strconv.Atoi(metricsPortStr)
+	if err != nil {
+		klog.Exitf("Failed to parse %s: %v", utils.MetricsPortEnvVar, err)
+	}
+
 	storageClient := &v1alpha1.StorageClient{}
 	storageClient.Name = storageClientName
 
@@ -112,6 +132,9 @@ func main() {
 	status.SetClientName(storageClientName)
 	status.SetClientID(string(storageClient.UID))
 	setStorageQuotaUtilizationRatio(ctx, cl, status)
+	metricsEndpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/metrics", metricsServiceName, operatorNamespace, metricsPort)
+	setCephFsPVCount(status, metricsEndpoint, storageClientName)
+	setCephFsVSCCount(status, metricsEndpoint, storageClientName)
 
 	if err := utils.SetClusterInformation(ctx, cl, status); err != nil {
 		klog.Warningf("Failed to set cluster information: %v", err)
@@ -146,5 +169,64 @@ func setStorageQuotaUtilizationRatio(ctx context.Context, cl client.Client, stat
 			status.SetStorageQuotaUtilizationRatio(math.Min(ratio, 1.0))
 		}
 	}
+}
 
+const (
+	cephFsPVCountMetric   = "ocs_client_operator_cephfs_pv_count"
+	cephFsVGSCCountMetric = "ocs_client_operator_cephfs_volume_snapshot_content_count"
+)
+
+func setCephFsPVCount(status interfaces.StorageClientStatus, metricsEndpoint, storageClientName string) {
+	count, err := fetchMetricValue(metricsEndpoint, cephFsPVCountMetric, storageClientName)
+	if err != nil {
+		klog.Warningf("Failed to get CephFS PV count from metrics: %v", err)
+		return
+	}
+	status.SetCephFsPVCount(uint32(count))
+}
+
+func setCephFsVSCCount(status interfaces.StorageClientStatus, metricsEndpoint, storageClientName string) {
+	count, err := fetchMetricValue(metricsEndpoint, cephFsVGSCCountMetric, storageClientName)
+	if err != nil {
+		klog.Warningf("Failed to get CephFS VolumeSnapshotContent count from metrics: %v", err)
+		return
+	}
+	status.SetCephFsVolumeSnapshotContentCount(uint32(count))
+}
+
+func fetchMetricValue(endpoint, metricName, storageClientName string) (float64, error) {
+	resp, err := http.Get(endpoint)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch metrics from %s: %v", endpoint, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body)
+		return 0, fmt.Errorf("metrics endpoint returned status %d", resp.StatusCode)
+	}
+
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	metricFamilies, err := parser.TextToMetricFamilies(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse metrics response: %v", err)
+	}
+
+	mf, ok := metricFamilies[metricName]
+	if !ok {
+		return 0, fmt.Errorf("metric %q not found", metricName)
+	}
+
+	for _, m := range mf.GetMetric() {
+		for _, lp := range m.GetLabel() {
+			if lp.GetName() == "storage_client" && lp.GetValue() == storageClientName {
+				if gauge := m.GetGauge(); gauge != nil {
+					return gauge.GetValue(), nil
+				}
+				return 0, fmt.Errorf("metric %q with storage_client=%q is not a gauge", metricName, storageClientName)
+			}
+		}
+	}
+
+	return 0, fmt.Errorf("metric %q with storage_client=%q not found", metricName, storageClientName)
 }
